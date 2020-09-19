@@ -26,6 +26,7 @@
 #include "interfaces/commands/add_signatory.hpp"
 #include "interfaces/commands/append_role.hpp"
 #include "interfaces/commands/call_engine.hpp"
+#include "interfaces/commands/call_model.hpp"
 #include "interfaces/commands/command.hpp"
 #include "interfaces/commands/compare_and_set_account_detail.hpp"
 #include "interfaces/commands/create_account.hpp"
@@ -190,7 +191,7 @@ namespace {
           SELECT
               COALESCE(bit_or(rp.permission), '0'::bit(%1%))
               & (%2%::bit(%1%) | '%3%'::bit(%1%))
-              != '0'::bit(%1%)
+              != '0'::bit(%1%) has_rp
           FROM role_has_permissions AS rp
               JOIN account_has_roles AS ar on ar.role_id = rp.role_id
               WHERE ar.account_id = %4%)")
@@ -693,7 +694,7 @@ namespace iroha {
                             THEN data->:creator->:key = :expected_value::jsonb
                         ELSE FALSE
                         END
-                    ELSE not :have_expected_value::boolean
+                    ELSE not (:check_empty::boolean and :have_expected_value::boolean)
                   END
             ),
             inserted AS
@@ -816,12 +817,17 @@ namespace iroha {
                  WHERE ar.account_id = :creator
            ),
            creator_has_enough_permissions AS (
-                SELECT ap.perm & dpb.bits = dpb.bits
-                FROM account_permissions AS ap, domain_role_permissions_bits AS dpb
+                SELECT ap.perm & dpb.bits = dpb.bits OR has_root_perm.has_rp
+                FROM
+                    account_permissions AS ap
+                  , domain_role_permissions_bits AS dpb
+                  , (%3%) as has_root_perm
+
            ),
            has_perm AS (%2%),
           )") % kRolePermissionSetSize
-                % checkAccountRolePermission(Role::kCreateAccount, ":creator"))
+                % checkAccountRolePermission(Role::kCreateAccount, ":creator")
+                % checkAccountRolePermission(Role::kRoot, ":creator"))
                    .str(),
                R"(AND (SELECT * FROM has_perm)
                 AND (SELECT * FROM creator_has_enough_permissions))",
@@ -1536,9 +1542,9 @@ namespace iroha {
           }
 
           using namespace shared_model::interface::types;
+          PostgresBurrowStorage burrow_storage(*sql_, tx_hash, cmd_index);
           return vm_caller_->get()
               .call(
-                  *sql_,
                   tx_hash,
                   cmd_index,
                   EvmCodeHexStringView{command.input()},
@@ -1547,6 +1553,7 @@ namespace iroha {
                       ? std::optional<EvmCalleeHexStringView>{command.callee()
                                                                   ->get()}
                       : std::optional<EvmCalleeHexStringView>{std::nullopt},
+                  burrow_storage,
                   *this,
                   *specific_query_executor_)
               .match(
@@ -1605,6 +1612,7 @@ namespace iroha {
       executor.use("target", command.accountId());
       executor.use("key", command.key());
       executor.use("new_value", new_json_value);
+      executor.use("check_empty", command.checkEmpty());
       executor.use("have_expected_value",
                    static_cast<bool>(command.oldValue()));
       executor.use("expected_value", expected_json_value);
@@ -1897,6 +1905,29 @@ namespace iroha {
       executor.use("precision", precision);
 
       return executor.execute();
+    }
+
+    CommandResult PostgresCommandExecutor::operator()(
+        const shared_model::interface::CallModel &command,
+        const shared_model::interface::types::AccountIdType &creator_account_id,
+        const std::string &tx_hash,
+        shared_model::interface::types::CommandIndexType,
+        bool do_validation) {
+      try {
+        if (do_validation) {
+          int has_permission = 0;
+          using namespace ::shared_model::interface::permissions;
+          *sql_ << checkAccountRolePermission(Role::kCallModel, ":creator"),
+              soci::use(creator_account_id, "creator"),
+              soci::into(has_permission);
+          if (has_permission == 0) {
+            return makeCommandError("CallModel", 2, "Not enough permissions.");
+          }
+        }
+      } catch (std::exception const &e) {
+        return makeCommandError("CallModel", 1, e.what());
+      }
+      return {};
     }
 
     CommandResult PostgresCommandExecutor::operator()(
